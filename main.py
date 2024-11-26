@@ -27,46 +27,8 @@ def parse_date_time(dateTime):
 
 
 
-def fetch_pull_requests(owner, repo):
-    query = """
-    query ($owner: String!, $repo: String!, $cursor: String) {
-        repository(owner: $owner, name: $repo) {
-            pullRequests(first: 10, orderBy: {field: CREATED_AT, direction: DESC}, after: $cursor) {
-                nodes {
-                    title
-                    createdAt
-                    mergedAt
-                    commits(first: 1) {
-                        nodes {
-                            commit {
-                                committedDate
-                            }
-                        }
-                    }
-                    timelineItems(last: 10) {
-                        nodes {
-                            __typename
-                            ... on ReviewRequestedEvent {
-                                createdAt
-                            }
-                            ... on PullRequestReview {
-                                createdAt
-                                state
-                            }
-                        }
-                    }
-                }
-                pageInfo {
-                    hasNextPage
-                    endCursor
-                }
-            }
-        }
-    }
-    """
-
-    variables = {"owner": owner, "repo": repo, "cursor": None}
-    all_pull_requests = []
+def fetch_data(query, variables, max_items):
+    results=[]
 
     while True:
         try:
@@ -82,27 +44,100 @@ def fetch_pull_requests(owner, repo):
                 print("GraphQL Errors:", response_data['errors'])
                 break
 
-            pull_requests = response_data['data']['repository']['pullRequests']
-            all_pull_requests.extend(pull_requests['nodes'])
-            
-            # Stop fetching if we've reached 100 pull requests
-            if len(all_pull_requests) >= 10 or not pull_requests['pageInfo']['hasNextPage']:
+            data= response_data['data']['repository']
+            key= next(iter(data))
+            results.extend(data[key]["nodes"])
+
+            if len(results) >= max_items:
+                results = results[:max_items]
                 break
 
-            variables["cursor"] = pull_requests['pageInfo']["endCursor"]
-
+            if not data[key]['pageInfo']['hasNextPage']:
+                break
+            
+            variables["cursor"] = data[key]['pageInfo']['endCursor']
         except requests.exceptions.RequestException as e:
             print(f"Request Error: {e}")
             break
         except KeyError as e:
             print(f"Key Error: {e}. Check the response structure.")
             break
+    
+
 
     # Limit the result to exactly 100 in case we overshot slightly
-    return all_pull_requests[:10]
+    return results
+
+pull_request_query = """
+query ($owner: String!, $repo: String!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequests(first: 10, orderBy: {field: CREATED_AT, direction: DESC}, after: $cursor) {
+      nodes {
+        title
+        createdAt
+        mergedAt
+        commits(first: 1) {
+          nodes {
+            commit {
+              oid
+              committedDate
+            }
+          }
+        }
+        timelineItems(last: 50) {
+          nodes {
+            __typename
+            ... on ReviewRequestedEvent {
+              createdAt
+            }
+            ... on PullRequestReview {
+              createdAt
+              state
+            }
+          }
+        }
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+}
+"""
+
+deployment_query = """
+query ($owner: String!, $repo: String!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    deployments(first: 50, after: $cursor, environments: ["production"]) {
+      nodes {
+        id
+        createdAt
+        state
+        commitOid
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+}
+"""
+
+def fetch_events(owner,repo):
+    variables= {"owner": owner, "repo": repo, "cursor": None}
+
+    all_pull_requests = fetch_data(pull_request_query, variables, max_items=50)
+
+    variables["cursor"] = None  
+
+    all_deployments = fetch_data(deployment_query, variables, max_items=50)
+
+    return all_pull_requests, all_deployments
 
 
-def calculate_metrics(all_pull_requests):
+def calculate_metrics(all_pull_requests,all_deployments):
     metrics={
         'Title':[],
         'CreatedAt':[],
@@ -110,10 +145,14 @@ def calculate_metrics(all_pull_requests):
         'FirstCommit':[],
         'CodingTime':[],
         'PR_PickupTime':[],
-        'ReviewTime':[]
+        'ReviewTime':[],
+        'DeployTime':[]
     }
 
-    
+    deployment_dict={}
+    for dp in all_deployments:
+        deployment_dict[dp['commitOid']]= parse_date_time(dp['createdAt'])
+
     for pr in all_pull_requests:
             title= pr['title']
             metrics['Title'].append(title)
@@ -171,12 +210,23 @@ def calculate_metrics(all_pull_requests):
                 pr_review_time="N/A"
                 metrics["ReviewTime"].append(pr_review_time)
             
-            
+            if merged_at and pr['commits']['nodes']:
+                deploy_time=deployment_dict.get(pr["commits"]['nodes'][0]["commit"]["oid"])
+                
+                if deploy_time and merged_at:
+                    deployment_time= deploy_time-merged_at
+                else:
+                    deployment_time='N/A'
+            else: 
+                deployment_time= 'N/A'
+
+            metrics['DeployTime'].append(deployment_time)
+        
 
     return metrics
         
-pull_requests= fetch_pull_requests(owner='facebook',repo='react')
-metrics=calculate_metrics(pull_requests) 
+pull_requests, deployments= fetch_events(owner='jesseduffield',repo='lazydocker')
+metrics=calculate_metrics(pull_requests, deployments) 
 
 
 df=pd.DataFrame(metrics)
